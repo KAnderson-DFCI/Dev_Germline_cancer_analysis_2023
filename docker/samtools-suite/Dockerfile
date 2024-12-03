@@ -1,5 +1,5 @@
 FROM ubuntu:focal-20220531
-MAINTAINER "Kyler Anderson <kyler_anderson@dfci.harvard.edu>"
+LABEL Author "Kyler Anderson <kyler_anderson@dfci.harvard.edu>"
 
 # Install basic linux libraries and dev packages
 RUN apt-get clean && \
