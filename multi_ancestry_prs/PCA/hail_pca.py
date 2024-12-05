@@ -1,16 +1,27 @@
-import sys, os
+import sys, os, re
+from posixpath import basename, join, splitext
+from datetime import datetime, timedelta
 from argparse import ArgumentParser
-from os.path import basename, join
-import re
+from typing import Callable
 
 from joblib import dump, load
 
-import pandas as pd
 import numpy as np
+import pandas as pd
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import cross_val_score
 
 import hail as hl
+import hailtop.fs as hlfs
+
+
+datetimeformat = '%A %B %#d, %Y, %H:%M:%S' if sys.platform == 'win32' else '%A %B %-d, %Y, %H:%M:%S'
+timeformat = '%H:%M:%S'
+
+file_readers = {
+    '.mt': hl.read_matrix_table,
+    '.ht': hl.read_table
+}
 
 
 ### Arguments
@@ -62,6 +73,7 @@ file2_args.add_argument('refloadings',
 file2_args.add_argument('refRFmodel',
                         help='joblib dump of a sklearn RandomForestClassifier trained on reference PCs -> population class')
 
+
 config = {
     'ref_gen' : 'GRCh38',
     'k': 10, # number of pcs
@@ -70,26 +82,37 @@ config = {
     'ld_r2': 0.1
 }
 
-def PCcols(n):
-    return [f'PC{i}' for i in range(1, n+1)]
 
-# inputs
+def stage(f: Callable[..., hl.MatrixTable | hl.Table]):
+    def checkpoint(*args, cpn, **kwargs):
+        cpfn = mkfname(cpn, kwargs.pop("base", None))
+        if hlfs.exists(cpfn):
+            stamp('Reading stored result from {cpfn}')
+            _, ext = splitext(cpfn)
+            return file_readers[ext](cpfn)
+        out = f(*args, **kwargs)
+        stamp('Writing result to {cpfn}')
+        out.write(cpfn)
+        return out
+    return checkpoint
+        
+
 def run(args):
     global config
+
     config = vars(clap.parse_args(args))
     if config['bucket'] == None:
         print("No cloud bucket specified, hail files may be lost (including reference pc variant loadings)")
         config['bucket'] = "."
+    config['datadir'] = join(config['bucket'], 'hail', 'data')
+    config['start'] = datetime.now()
 
     sconf = dict(pair.split('=') for pair in config['spark_conf'].split())
     hl.init(app_name='PCA-RF',
             quiet=True,
             tmp_dir=join(config['bucket'], 'hail', 'tmp'),
-            spark_conf=sconf)
-
-    spark_conf = hl.spark_context().getConf().getAll()
-    sc_tree = branchy_tree(spark_conf)
-    display_tree(sc_tree)
+            spark_conf=sconf,
+            log='hail.log')
 
     if config['proc'] == 'build-reference':
         ref_loadings_ht, rf = build_reference(config['reference-vcf'], config['population-tsv'], config['pop_col'])
@@ -100,21 +123,33 @@ def run(args):
 
 
 def build_reference(refvcf, refpoptsv, pop_col):
-    # hail can't take '.bcf' files anyway, but let's keep it portable
-    refbase = re.sub("\.[bv]cf\.gz", "", basename(refvcf))
+    stamp('Beginning reference building', True)
+
+    # hail can't import '.bcf' files, but let's keep it portable
+    config['filebase'] = re.sub("\.[bv]cf\.gz", "", basename(refvcf))
+    display_config(mkfname('.config.txt'))
+    file_stages = ['unprocessed.mt', 'filtered.mt', 'pruned.mt', 'pcs.ht']
+    stage = resume(file_stages)
     
-    # perform pca
-    ref_mt = hl.import_vcf(refvcf, force_bgz=refvcf.endswith('.gz'), reference_genome=config['reference'],
-                           array_elements_required=False)
-    ref_mt = prep_mt_pca(ref_mt, config['af_min'], config['hwe_p'], config['ld_r2']) # atomizing should help with garbage collection
-    _, ref_pcs_ht, ref_loadings_ht = hl.hwe_normalized_pca(ref_mt.GT, k=config['k'], compute_loadings=True)
+    if stage == 0:
+        stamp('Importing variants')
+        mt = import_variants(refvcf, cpn='unprocessed.mt')
+
+    if stage == 1:
+        stamp('Filtering')
+        mt = prep_mt_pca(ref_mt, config['af_min'], config['hwe_p'], config['ld_r2'])
     
+    if stage == 2:
+        stamp('\n\nCalculating PCs...\n')
+        _, ref_pcs_ht, ref_loadings_ht = hl.hwe_normalized_pca(ref_mt.GT, k=config['k'], compute_loadings=True)
+
     # annotate loadings with allele frequencies
     ref_mt = ref_mt.annotate_rows(af = hl.agg.mean(ref_mt.GT.n_alt_alleles()) / 2)                
-    ref_loadings_ht = ref_loadings_ht.annotate(af=ref_mt.rows()[ref_loadings_ht.key].af)         
+    ref_loadings_ht = ref_loadings_ht.annotate(af=ref_mt.rows()[ref_loadings_ht.key].af)  
+    print('\n\nVariant Weights Annotated\n')       
 
     ### output loadings for reuse
-    ref_loadings_ht.write(join(config['bucket'], 'hail', f'{refbase}.loadings.ht'),
+    ref_loadings_ht.write(join(config['bucket'], 'hail', 'data', f'{refbase}.loadings.ht'),
                           overwrite=True)
 
     PCs = PCcols(config['k'])
@@ -144,8 +179,20 @@ def build_reference(refvcf, refpoptsv, pop_col):
     return ref_loadings_ht, rf
 
 
-def prep_mt_pca(mt, aft=0.01, hwe_pt=1e-6, ld_r2=0.1):
-    print("Filtering", mt.count(), 'variants.')
+@stage
+def import_variants(vcf):
+    stamp('Converting VCF to MatrixTable')
+    hl.import_vcf(vcf,
+                  force_bgz=vcf.endswith('.gz'),
+                  reference_genome=config['reference'],
+                  array_elements_required=False)\
+        .write('cvt.mt', overwrite=True)
+    stamp('Reading variant matrix')
+    return hl.read_matrix_table('cvt.mt')
+
+@stage
+def prep_mt_pca(mt: hl.MatrixTable, aft=0.01, hwe_pt=1e-6, ld_r2=0.1):
+    stamp(f'Filtering {mt.count()} variants')
 
     # missing calls > ref
     filled_gt = hl.if_else(hl.is_defined(mt.GT), mt.GT, hl.Call([0, 0]))
@@ -158,12 +205,18 @@ def prep_mt_pca(mt, aft=0.01, hwe_pt=1e-6, ld_r2=0.1):
     # remove variants out of hardy weinberg equilibrium
     mt = mt.filter_rows(mt.variant_qc.p_value_hwe > hwe_pt)
 
+    stamp(f'LD pruning on {mt.count()} variants')
     # remove variants in linkage disequilibrium
     ld_keep = hl.ld_prune(mt.GT, r2=ld_r2)
     mt = mt.filter_rows(hl.is_defined(ld_keep[mt.row_key]))
     
-    print(mt.count(), 'variants remaining.')
+    stamp(mt.count(), 'variants remaining.')
     return mt
+
+@stage
+def do_pca():
+    
+
 
 
 def infer_samples(samplevcf, refloadings, refRF, need_load=True):
@@ -198,6 +251,48 @@ def infer_samples(samplevcf, refloadings, refRF, need_load=True):
 
 
 ### Utilities
+
+def mkfname(fn, base=None):
+    if base is None: base = config['filebase']
+    return join(config['datadir'], base + '.' + fn)
+
+def stamp(message, fulltime=False):
+    ct = datetime.now()
+    td = format_td(config['start'] - td)
+
+    if not fulltime:
+        print(ct.strftime(timeformat),
+              f'({td}) {message}')
+    else:
+        print(ct.strftime(datetimeformat))
+        print('  ' + message)
+
+def format_td(td: timedelta):
+    s = int(td.total_seconds())
+    return f'{s//3600:0>3}:{s//60%60:0>2}:{s%60:0>2}'
+
+
+def resume(stages):
+    files = [mkfname(s) for s in stages]
+    for i, f in enumerate(files):
+        if not hlfs.exists(f):
+            break
+    return i-1
+
+
+
+def PCcols(n):
+    return [f'PC{i}' for i in range(1, n+1)]
+
+def display_config(to=None):
+    spark_conf = hl.spark_context().getConf().getAll()
+    sc_tree = branchy_tree(spark_conf)
+    if to is None:
+        display_tree(sc_tree)
+        return
+    with open(to, 'w') as out:
+        display_tree(sc_tree, to)
+
 def branchy_tree(paths, prefix=""):
     if len(paths) == 1: return {paths[0][0]: paths[0][1]}
     
@@ -229,14 +324,15 @@ def branchy_tree(paths, prefix=""):
         
     return {gcp[:-1]: tree}
 
-def display_tree(tree, i=0):
+def display_tree(tree, i=0, to=None):
     for k, v in tree.items():
-        print(" |"*i + "-" + str(k), end='')
+        print(" |"*i + "-" + str(k), end='', file=to)
         if type(v) == dict:
             print()
-            display_tree(v, i+1)
+            display_tree(v, i+1, to)
         else:
-            print(" = " + str(v))
+            print(" = " + str(v), to)
+
 
 if __name__ == "__main__":
     run(sys.argv[1:])
