@@ -3,6 +3,8 @@ from multiprocessing import Pool, Lock, Queue
 import sys, os, re, sqlite3
 from os.path import basename, exists
 from functools import partial
+from datetime import datetime, timedelta
+import tzdata
 
 from collections import defaultdict as ddict, Counter
 import random # used for randomly naming child processes in log output.
@@ -22,13 +24,14 @@ FROM contig
 WHERE name = ?
 """
 
-# data, sample column, locus line
+# alt, class, sample column, locus line
 _ADD_VARIANT_ = """
 INSERT INTO variant VALUES (?, ?, ?, ?)
 """
-# line, contig id, position, format
+# contig id, position, ref, info
 _ADD_LOCUS_ = """
-INSERT INTO locus VALUES (?, ?, ?, ?)
+INSERT INTO locus (cid, pos, ref, info)
+VALUES (?, ?, ?, ?)
 """
 # column, name
 _ADD_SAMPLE_ = """
@@ -36,7 +39,6 @@ INSERT INTO sample VALUES (?, ?)
 """
 
 dblock = None
-nameq = None
 
 name = None
 vcf = None
@@ -44,6 +46,7 @@ vcfopen = None
 data_top = None
 data_len = None
 nchunks = None
+logfh = None
 
 dbn = None
 dbcon = None
@@ -60,6 +63,10 @@ names2 = ['Arvo', 'Brio', 'Cujo', 'Dido', 'Echo', 'Fafo', 'Geko',
           'Urso', 'Volo', 'Wako', 'Xylo', 'Yoyo', 'Zero']
 
 def main():
+  global name
+  name = 'Prologue'
+  open_logfh()
+
   vcf = sys.argv[1]
   ncpu = int(sys.argv[2]) if len(sys.argv) > 2 else 1
   chunks = max(ncpu, int(sys.argv[3])) if len(sys.argv) > 3 else ncpu
@@ -70,7 +77,7 @@ def main():
 
   contigs = []
   with vcfopen(vcf) as inp:
-    print('Parsing Header...')
+    log('Parsing Header...')
     while True:
       line = inp.readline()
       if line.startswith('##contig'):
@@ -80,14 +87,14 @@ def main():
       samples = data[9:]
       break
     data_top = inp.tell()
-    print(f'Found top of data at byte {data_top}')
+    log(f'Found top of data at byte {data_top}')
     data_end = inp.seek(0, 2)
-    print(f'Found end of data at byte {data_end}')
+    log(f'Found end of data at byte {data_end}')
 
   data_len = data_end - data_top
 
-  print('Initializing database...')
-  dbn = base + '.issues.db'
+  log('Initializing database...')
+  dbn = base + '.v.db'
   create_database(dbn)
   con = sqlite3.connect(dbn)
   con.executemany(_ADD_CONTIG_, [(c,) for c in contigs])
@@ -95,37 +102,43 @@ def main():
   con.commit()
   con.close()
 
-  print('Initializing Worker(s)...')
-  global dblock, nameq
+  log('Initializing Worker(s)...')
+  global dblock
   nameq = Queue()
   for s in random.sample(range(26**2), ncpu):
     nameq.put_nowait(s)
 
-  conf = (vcf, dbn, gz, data_top, data_len, chunks if ncpu > 1 else 1)
+  conf = (nameq, vcf, dbn, gz, data_top, data_len,
+          chunks if ncpu > 1 else 1,
+          Lock() if ncpu > 1 else None)
 
   if ncpu == 1:
-    print('Executing in single process.')
+    log('Executing in single process.')
+    logfh.close()
+
     init_worker(*conf)
-    process_vcf()
+    process_vcf_logged()
   else:
-    print(f'Executing in process pool({ncpu}).')
-    dblock = Lock()
+    log(f'Executing in process pool({ncpu}).')
     
     p = Pool(ncpu, initializer=init_worker, initargs=conf)
     for i in range(chunks):
-      p.apply_async(process_vcf, (i,))
+      p.apply_async(process_vcf_logged, (i,))
 
     p.close()
     p.join()
+    logfh.close()
 
 
 def build_name(a: int) -> str:
   return names1[a%26] + '-' + names2[a//26]
 
-def init_worker(v, d, gz, dt, dl, nc):
-  global name, vcf, data_top, data_len, nchunks, \
-    dbn, dbcon, dbcrs, vcfopen, transact
-  name = build_name(nameq.get())
+def init_worker(nq, v, d, gz, dt, dl, nc, dbl):
+  global name, vcf, vcfopen, data_top, data_len, nchunks, \
+    dbn, dbcon, dbcrs, dblock, transact
+  name = build_name(nq.get())
+  open_logfh()
+
   nchunks = nc
 
   vcf = v
@@ -136,28 +149,22 @@ def init_worker(v, d, gz, dt, dl, nc):
   dbn = d
   dbcon = sqlite3.connect(dbn)
   dbcrs = dbcon.cursor()
+  dblock = dbl
   transact = safe_execute if nchunks > 1 else execute
 
 
-def merge_count_maps():
-  pass
-
-
 def safe_execute(stmt, args, many=False):
-  print(name, 'executing')
   try:
     dblock.acquire()
-    print(name, 'obtained lock')
     execute(stmt, args, many)
   except:
-    print('Bonk')
-    print(sys.exc_info())
+    log('Bonk')
+    log(sys.exc_info())
   finally:
     try:
       dblock.release()
-      print(name, 'released lock')
     except:
-      print('Bonked')
+      log('Bonked')
 
 def execute(stmt, args, many=False):
   if many:
@@ -170,21 +177,48 @@ def execute(stmt, args, many=False):
 def get_chunk_b(funk):
   return int(data_top + data_len * (funk/nchunks))
 
+
+def open_logfh():
+  global logfh
+  os.makedirs('logs', exist_ok=True)
+  logfh = open(os.path.join('logs', name + '.log'), 'w+')
+
+def log(message):
+  print(message, file=logfh)
+
+
+def process_vcf_logged(funk=0):
+  log(f'{name} Reporting for duty!')
+  try:
+    process_vcf(funk)
+  except:
+    log(sys.exc_info())
+  finally:
+    logfh.close()
+
+def timeform(td: timedelta):
+  s = td.total_seconds()
+  return f'{s//3600:0>3}:{s//60%60:0>2}:{s%60:0>2}'
+
 def process_vcf(funk=0):
+  log('Assigned chunk '+funk)
   if nchunks == 1:
-    sb, eb = data_len, data_top
+    sb, eb = data_top, data_len + data_top
   else:
     sb = get_chunk_b(funk)
-    se = get_chunk_b(funk+1)
+    eb = get_chunk_b(funk+1)
 
   loci = 0
   lxrm = None
   cid = None
+  lcomp = 0
+  start_time = datetime.now()
   with vcfopen(vcf) as inp:
     inp.seek(sb-1)
     if inp.read(1) != '\n': inp.readline()
 
-    while inp.tell() < se:
+    while inp.tell() < eb:
+
       line = inp.readline()
       xrm, pos, ref, info, vrts = process_line(line)
 
@@ -194,7 +228,8 @@ def process_vcf(funk=0):
           transact(_ADD_COUNT_, (loci, cid))
           loci = 0
         transact(_GET_CONTIG_ID_, (xrm,))
-        cid = int(dbcrs.fetchone())
+        fetch = dbcrs.fetchone()
+        cid = int(fetch[0])
         lxrm = xrm
 
       loci += 1
@@ -202,9 +237,16 @@ def process_vcf(funk=0):
       lid = dbcrs.lastrowid
       transact(_ADD_VARIANT_, [(*acs, lid) for acs in vrts], many=True)
 
+      ccomp = int((inp.tell()-sb) / (eb-sb) *100)
+      if ccomp > lcomp:
+        lcomp = ccomp
+        tdiff = datetime.now() - start_time
+        human_time = timeform(tdiff)
+        log(f'{human_time} {lcomp: >3}%')
+
     if lxrm:
       transact(_ADD_COUNT_, (loci, cid))
-  
+    
   dbcon.close()
 
 
@@ -215,8 +257,8 @@ def tabulate_rowform(form, sample_data):
 def process_line(line):
   data = line.strip().split()
   xrm, pos = data[0:2]
-  ref = data[3]
-  alts = data[4].split(',')
+  ref = data[3].lower()
+  alts = [a.lower() for a in data[4].split(',')]
   alcs = [vrt_type(ref, a) for a in alts]
   info = data[7]
   sample_forms = tabulate_rowform(data[8], data[9:])
@@ -280,11 +322,11 @@ def create_database(dbn):
   
   cur.execute("""
               CREATE TABLE locus(
+                line INTEGER PRIMARY KEY,
                 cid REFERENCES contig,
                 pos INT,
                 ref VARCHAR(20),
-                info VARCHAR(100),
-                line INTEGER PRIMARY KEY
+                info VARCHAR(100)
               )""")
   
   cur.execute("""
@@ -308,4 +350,5 @@ def create_database(dbn):
 if __name__ == '__main__':
   main()
 
-# python variant_database.py "..\\misc_data\\1KGQ_common_pop_phased.vcf.gz" 6 100
+# python variant_database.py "..\misc_data\1KGQ_common_pop_phased.vcf.gz" 6 100
+# python variant_database.py "..\multi_ancestry_prs\vcf_inspection\hg00188.vcf.gz" 6 6
