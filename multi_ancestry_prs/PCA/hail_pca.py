@@ -3,6 +3,7 @@ from posixpath import basename, join, splitext
 from datetime import datetime, timedelta
 from argparse import ArgumentParser
 from collections.abc import Callable, Sequence
+from typing import Union
 
 from joblib import dump, load
 
@@ -13,9 +14,6 @@ from sklearn.model_selection import cross_val_score
 
 import hail as hl
 import hailtop.fs as hlfs
-
-
-
 
 
 ### Arguments
@@ -77,7 +75,7 @@ config = {
 }
 
 # Helpful abbreviations
-type hlo = hl.MatrixTable | hl.Table
+hlo = Union[hl.MatrixTable, hl.Table]
 file_readers = {
     '.mt': hl.read_matrix_table,
     '.ht': hl.read_table
